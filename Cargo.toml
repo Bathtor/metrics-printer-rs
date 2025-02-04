@@ -1,6 +1,6 @@
 [package]
 name = "metrics_printer"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Lars Kroll <bathtor@googlemail.com>"]
 edition = "2018"
 description = "A recorder for the metrics library that prints metric values to an output in regular intervals."
@@ -9,7 +9,7 @@ homepage = "https://github.com/Bathtor/metrics-printer-rs"
 repository = "https://github.com/Bathtor/metrics-printer-rs"
 readme = "README.md"
 keywords = ["metrics", "logging"]
-categories = ["development-tools::debugging", "logging"]
+categories = ["development-tools::debugging"]
 license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
