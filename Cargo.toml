@@ -15,8 +15,8 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-metrics 		= "0.14"
-metrics-util	= "0.6"
+metrics 		= "0.24"
+metrics-util	= "0.19"
 
 [badges]
 # Maintenance: `status` is required Available options are `actively-developed`,

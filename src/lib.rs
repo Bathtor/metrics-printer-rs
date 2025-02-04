@@ -1,9 +1,9 @@
-//! This crate provides you with a [metrics](metrics) recorder
+//! This crate provides you with a [metrics] recorder
 //! that can print all metrics to a target of your choice in regular intervals.
 //!
 //! It uses a thread to print, so it doesn't interfere with other threads' work directly.
 //!
-//! Custom printing targets (e.g., logging frameworks) can be provided via the simple [Printer](Printer)
+//! Custom printing targets (e.g., logging frameworks) can be provided via the simple [Printer]
 //! trait, while default implementations for [stdout](StdoutPrinter) and [stderr](StderrPrinter) are provided.
 //!
 //! # Example
@@ -15,21 +15,24 @@
 //! use metrics_printer::*;
 //!
 //! PrintRecorder::default().install().unwrap();
-//! register_counter!("test.counter");
 //! for _i in 0..300 {
-//!     increment_counter!("test.counter");
+//!     counter!("test.counter").increment(1);
 //!     std::thread::sleep(Duration::from_millis(10));
 //! }
 //! ```
 #![deny(missing_docs)]
 
-use metrics::{GaugeValue, Key, NameParts, Recorder, SetRecorderError, Unit};
-use metrics_util::{CompositeKey, Handle, MetricKind, Quantile, Registry, Summary};
+use metrics::{Key, Recorder, SetRecorderError, Unit};
+use metrics_util::{
+    registry::{GenerationalAtomicStorage, Registry},
+    storage::Summary,
+    CompositeKey, MetricKind, Quantile,
+};
 use std::{
     collections::HashMap,
     fmt::Write,
     iter::FromIterator,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -75,8 +78,8 @@ pub struct PrintRecorder<P>
 where
     P: Printer + Send + Sync + 'static,
 {
-    registry: Registry<CompositeKey, Handle>,
-    metdadata: Mutex<HashMap<NameParts, MetaDataEntry>>,
+    registry: Registry<Key, GenerationalAtomicStorage>,
+    metadata: RwLock<HashMap<MetadataKey, MetaDataEntry>>,
     printer: P,
     print_interval: Duration,
     print_metadata: bool,
@@ -97,8 +100,8 @@ where
     /// New PrinterRecorder with 1s interval no metadata printing.
     pub fn new(printer: P) -> Self {
         PrintRecorder {
-            registry: Registry::new(),
-            metdadata: Mutex::new(HashMap::new()),
+            registry: Registry::new(GenerationalAtomicStorage::atomic()),
+            metadata: RwLock::new(HashMap::new()),
             printer,
             print_interval: DEFAULT_PRINT_INTERVAL,
             print_metadata: false,
@@ -113,14 +116,25 @@ where
     }
 
     /// Print units and descriptions together with the metrics
+    #[deprecated(note = "Typo. Use `do_print_metadata` instead.")]
     pub fn do_print_medata(&mut self) -> &mut Self {
+        self.do_print_metadata()
+    }
+    /// Do not print units and descriptions together with the metrics
+    #[deprecated(note = "Typo. Use `skip_print_metadata` instead.")]
+    pub fn skip_print_medata(&mut self) -> &mut Self {
+        self.skip_print_metadata()
+    }
+
+    /// Print units and descriptions together with the metrics
+    pub fn do_print_metadata(&mut self) -> &mut Self {
         self.print_metadata = true;
         self
     }
 
     /// Do not print units and descriptions together with the metrics
-    pub fn skip_print_medata(&mut self) -> &mut Self {
-        self.print_metadata = true;
+    pub fn skip_print_metadata(&mut self) -> &mut Self {
+        self.print_metadata = false;
         self
     }
 
@@ -130,12 +144,22 @@ where
         self
     }
 
-    fn insert_metadata(&self, key: NameParts, data: MetaDataEntry) {
+    fn set_metadata_if_missing(
+        &self,
+        kind: MetricKind,
+        key: metrics::KeyName,
+        data: MetaDataEntry,
+    ) -> bool {
         let mut guard = self
-            .metdadata
-            .lock()
+            .metadata
+            .write()
             .expect("Could not acquire metadata lock");
-        guard.insert(key, data);
+        let k = MetadataKey(kind, key);
+        if guard.contains_key(&k) {
+            return false;
+        }
+        guard.insert(k, data);
+        return true;
     }
 
     /// Register this recorder as the global recorder,
@@ -148,9 +172,8 @@ where
     ///
     /// Also starts the background thread for printing.
     pub fn install_if_free(self) {
-        if metrics::try_recorder().is_none() {
-            let _ = self.install(); // ignore result
-        }
+        #[allow(unused_must_use)]
+        self.install(); // ignore result
     }
 
     /// Register this recorder as the global recorder,
@@ -159,17 +182,19 @@ where
     /// If another recorder is registered, this will return an error.
     ///
     /// Also starts the background thread for printing.
-    pub fn install(self) -> Result<(), SetRecorderError> {
+    pub fn install(self) -> Result<(), SetRecorderError<Arc<Self>>> {
         let arced = Arc::new(self);
         let wrapped = PrintRecorderWrapper(arced.clone());
         // this can still fail due to parallelism
-        let res = metrics::set_boxed_recorder(Box::new(wrapped));
-        if res.is_ok() {
-            Self::start_thread(arced);
+        let res = metrics::set_global_recorder(Box::new(wrapped));
+        match res {
+            Ok(()) => {
+                Self::start_thread(arced);
+                return Ok(());
+            }
+            Err(wrapped) => return Err(SetRecorderError(wrapped.0.into_inner())),
         }
-        res
     }
-
     fn start_thread(arc_self: Arc<Self>) {
         std::thread::Builder::new()
             .name("stdout-recorder".to_string())
@@ -191,22 +216,35 @@ where
     }
 
     fn take_snapshot(&self, mut summaries: HashMap<CompositeKey, Summary>) -> Snapshot {
-        self.registry.map_collect(|key, _gen, handle| {
-            let value = match key.kind() {
-                MetricKind::Counter => SnapshotValue::Counter(handle.read_counter()),
-                MetricKind::Gauge => SnapshotValue::Gauge(handle.read_gauge()),
-                MetricKind::Histogram => {
-                    let mut summary = summaries.remove(key).unwrap_or_else(Summary::with_defaults);
-                    handle.read_histogram_with_clear(|entries| {
-                        for entry in entries {
-                            summary.add(*entry);
-                        }
-                    });
-                    SnapshotValue::Histogram(Box::new(summary))
+        let mut snapshot_values = Vec::new();
+        self.registry.visit_counters(|key, counter| {
+            let value = counter.get_inner().load(Ordering::Relaxed);
+            snapshot_values.push((
+                CompositeKey::new(MetricKind::Counter, key.clone()),
+                SnapshotValue::Counter(value),
+            ));
+        });
+        self.registry.visit_gauges(|key, gauge| {
+            let value_bits = gauge.get_inner().load(Ordering::Relaxed);
+            let value = f64::from_bits(value_bits);
+            snapshot_values.push((
+                CompositeKey::new(MetricKind::Gauge, key.clone()),
+                SnapshotValue::Gauge(value),
+            ));
+        });
+        self.registry.visit_histograms(|key, histogram| {
+            let key2 = CompositeKey::new(MetricKind::Histogram, key.clone());
+            let mut summary = summaries
+                .remove(&key2)
+                .unwrap_or_else(Summary::with_defaults);
+            histogram.get_inner().clear_with(|entries| {
+                for entry in entries {
+                    summary.add(*entry);
                 }
-            };
-            (key.clone(), value)
-        })
+            });
+            snapshot_values.push((key2, SnapshotValue::Histogram(Box::new(summary))));
+        });
+        snapshot_values.into_iter().collect()
     }
 
     fn stringify_metrics(
@@ -239,8 +277,8 @@ where
                 .collect();
             let row = [key, kind, value, delta, labels.join(", ")];
             if self.print_metadata {
-                let guard = self.metdadata.lock().unwrap();
-                if let Some(metadata) = guard.get(entry.key().name()) {
+                let guard = self.metadata.read().unwrap();
+                if let Some(metadata) = guard.get(&entry.metadata_key()) {
                     let unit = metadata
                         .unit
                         .as_ref()
@@ -249,6 +287,7 @@ where
                     longest_unit = longest_unit.max(unit.len());
                     let description = metadata
                         .description
+                        .as_ref()
                         .map(|d| d.to_string())
                         .unwrap_or_else(|| "N/A".to_string());
                     longest_description = longest_description.max(description.len());
@@ -342,14 +381,17 @@ where
 
         output
     }
+    fn registry(&self) -> &Registry<Key, GenerationalAtomicStorage> {
+        &self.registry
+    }
 }
 
 struct MetaDataEntry {
     unit: Option<Unit>,
-    description: Option<&'static str>,
+    description: Option<metrics::SharedString>,
 }
 impl MetaDataEntry {
-    fn new(unit: Option<Unit>, description: Option<&'static str>) -> Self {
+    fn new(unit: Option<Unit>, description: Option<metrics::SharedString>) -> Self {
         MetaDataEntry { unit, description }
     }
 }
@@ -370,51 +412,74 @@ impl<P> Recorder for PrintRecorderWrapper<P>
 where
     P: Printer + Send + Sync + 'static,
 {
-    fn register_counter(&self, key: Key, unit: Option<Unit>, description: Option<&'static str>) {
-        let key_name: NameParts = key.name().clone();
-        let k = CompositeKey::new(MetricKind::Counter, key);
-        self.0.registry.op(k, ignore, Handle::counter);
-        let metadata = MetaDataEntry::new(unit, description);
-        self.0.insert_metadata(key_name, metadata);
-    }
-
-    fn register_gauge(&self, key: Key, unit: Option<Unit>, description: Option<&'static str>) {
-        let key_name: NameParts = key.name().clone();
-        let k = CompositeKey::new(MetricKind::Gauge, key);
-        self.0.registry.op(k, ignore, Handle::gauge);
-        let metadata = MetaDataEntry::new(unit, description);
-        self.0.insert_metadata(key_name, metadata);
-    }
-
-    fn register_histogram(&self, key: Key, unit: Option<Unit>, description: Option<&'static str>) {
-        let key_name: NameParts = key.name().clone();
-        let k = CompositeKey::new(MetricKind::Histogram, key);
-        self.0.registry.op(k, ignore, Handle::histogram);
-        let metadata = MetaDataEntry::new(unit, description);
-        self.0.insert_metadata(key_name, metadata);
-    }
-
-    fn increment_counter(&self, key: Key, value: u64) {
-        let k = CompositeKey::new(MetricKind::Counter, key);
-        self.0
-            .registry
-            .op(k, |handle| handle.increment_counter(value), Handle::counter);
-    }
-
-    fn update_gauge(&self, key: Key, value: GaugeValue) {
-        let k = CompositeKey::new(MetricKind::Gauge, key);
-        self.0
-            .registry
-            .op(k, |handle| handle.update_gauge(value), Handle::gauge);
-    }
-
-    fn record_histogram(&self, key: Key, value: f64) {
-        let k = CompositeKey::new(MetricKind::Histogram, key);
-        self.0.registry.op(
-            k,
-            |handle| handle.record_histogram(value),
-            Handle::histogram,
+    fn describe_counter(
+        &self,
+        key: metrics::KeyName,
+        unit: Option<Unit>,
+        description: metrics::SharedString,
+    ) {
+        self.0.set_metadata_if_missing(
+            MetricKind::Counter,
+            key,
+            MetaDataEntry::new(unit, Some(description)),
         );
+    }
+
+    fn describe_gauge(
+        &self,
+        key: metrics::KeyName,
+        unit: Option<Unit>,
+        description: metrics::SharedString,
+    ) {
+        self.0.set_metadata_if_missing(
+            MetricKind::Gauge,
+            key,
+            MetaDataEntry::new(unit, Some(description)),
+        );
+    }
+
+    fn describe_histogram(
+        &self,
+        key: metrics::KeyName,
+        unit: Option<Unit>,
+        description: metrics::SharedString,
+    ) {
+        self.0.set_metadata_if_missing(
+            MetricKind::Histogram,
+            key,
+            MetaDataEntry::new(unit, Some(description)),
+        );
+    }
+
+    fn register_counter(&self, key: &Key, _metadata: &metrics::Metadata<'_>) -> metrics::Counter {
+        self.0
+            .registry()
+            .get_or_create_counter(key, |c| c.clone().into())
+    }
+
+    fn register_gauge(&self, key: &Key, _metadata: &metrics::Metadata<'_>) -> metrics::Gauge {
+        self.0
+            .registry()
+            .get_or_create_gauge(key, |c| c.clone().into())
+    }
+
+    fn register_histogram(
+        &self,
+        key: &Key,
+        _metadata: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        self.0
+            .registry()
+            .get_or_create_histogram(key, |c| c.clone().into())
+    }
+}
+
+impl<P> PrintRecorderWrapper<P>
+where
+    P: Printer + Send + Sync + 'static,
+{
+    fn into_inner(self) -> Arc<PrintRecorder<P>> {
+        self.0
     }
 }
 
@@ -582,7 +647,19 @@ impl DeltaEntry {
             DeltaEntry::Histogram { .. } => "Histogram",
         }
     }
-
+    fn metadata_key(&self) -> MetadataKey {
+        match self {
+            DeltaEntry::Counter { key, .. } => {
+                MetadataKey(MetricKind::Counter, key.name().to_owned().into())
+            }
+            DeltaEntry::Gauge { key, .. } => {
+                MetadataKey(MetricKind::Gauge, key.name().to_owned().into())
+            }
+            DeltaEntry::Histogram { key, .. } => {
+                MetadataKey(MetricKind::Histogram, key.name().to_owned().into())
+            }
+        }
+    }
     fn current_str(&self) -> String {
         match self {
             DeltaEntry::Counter { current, .. } => format!("{}", current),
@@ -641,10 +718,8 @@ fn collect_quantiles(quantiles: &[Quantile], summary: &Summary) -> Box<[(Quantil
         .collect()
 }
 
-#[allow(clippy::needless_lifetimes)]
-fn ignore<'a, T: 'static>(_t: &'a T) {
-    // do nothing
-}
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+struct MetadataKey(pub MetricKind, pub metrics::KeyName);
 
 #[cfg(test)]
 mod tests {
@@ -657,20 +732,30 @@ mod tests {
         #[allow(unused_mut)]
         let mut rec = PrintRecorder::default();
         // uncomment to see units and descriptions
-        //rec.do_print_medata();
+        rec.do_print_metadata();
         rec.install().unwrap();
 
-        register_counter!("test.counter", "A simple counter in a loop", "test" => "not_a_real_test");
-        register_gauge!("test.time_elapsed", Unit::Milliseconds, "The time that elapsed since starting the loop", "test" => "not_a_real_test");
-        register_histogram!("test.time_per_iter", Unit::Nanoseconds, "The time that elapsed for every loop", "test" => "not_a_real_test");
+        describe_counter!("test.counter", "A simple counter in a loop");
+        describe_gauge!(
+            "test.time_elapsed",
+            Unit::Milliseconds,
+            "The time that elapsed since starting the loop"
+        );
+        describe_histogram!(
+            "test.time_per_iter",
+            Unit::Nanoseconds,
+            "The time that elapsed for every loop"
+        );
         let start = Instant::now();
         let mut elapsed = start.elapsed();
         let mut last_elapsed = Duration::new(0, 0);
         while elapsed < Duration::from_secs(5) {
             let since_last_iter = elapsed - last_elapsed;
-            increment_counter!("test.counter", "test" => "not_a_real_test");
-            gauge!("test.time_elapsed", elapsed.as_millis() as f64, "test" => "not_a_real_test");
-            histogram!("test.time_per_iter", since_last_iter.as_nanos() as f64, "test" => "not_a_real_test");
+            counter!("test.counter", "test" => "not_a_real_test").increment(1);
+            gauge!("test.time_elapsed", "test" => "not_a_real_test")
+                .increment(elapsed.as_millis() as f64);
+            histogram!("test.time_per_iter", "test" => "not_a_real_test")
+                .record(since_last_iter.as_nanos() as f64);
             last_elapsed = elapsed;
             elapsed = start.elapsed();
         }
